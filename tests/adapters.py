@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+# from model import softmax
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
@@ -11,7 +12,8 @@ from torch import Tensor
 
 from cs336_basics.train_bpe import train_bpe
 from cs336_basics.tokenizer import Tokenizer
-from cs336_basics.model import Linear
+from cs336_basics.model import silu, softmax, scaled_dot_product_attention
+from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU
 
 def run_linear(
     d_in: int,
@@ -55,7 +57,8 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    embedding = Embedding(vocab_size=vocab_size, d_model=d_model, weights = weights)
+    return embedding.forward(token_ids)
 
 
 def run_swiglu(
@@ -87,7 +90,10 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # raise NotImplementedError
+
+    swiglu = SwiGLU(d_model=d_model, d_ff=d_ff, w1_weight=w1_weight, w2_weight=w2_weight, w3_weight=w3_weight)
+    return swiglu.forward(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -108,7 +114,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    sdpa = scaled_dot_product_attention(Q=Q, K=K, V=V, mask=mask)
+    return sdpa
 
 
 def run_multihead_self_attention(
@@ -382,7 +389,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+
+    RMSNorm_layer = RMSNorm(d_model=d_model, eps=eps, weights=weights)
+    return RMSNorm_layer.forward(in_features)
+    
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -396,7 +406,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return silu(in_features)
 
 
 def run_get_batch(
@@ -435,7 +445,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim=dim)
 
 
 def run_cross_entropy(
