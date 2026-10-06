@@ -1,4 +1,5 @@
 from typing import Iterator
+from collections import Counter, defaultdict
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 import regex as re
 
@@ -63,12 +64,12 @@ def merge_pair(token_sequence: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> 
             i += 1
     return tuple(merged_sequence)  # Return the new sequence with the merged pair
 
-def get_most_frequent_pair(pair_counts: dict[tuple[bytes, bytes], int]) -> tuple[bytes, bytes]:
+def get_most_frequent_pair(pair_counts: dict[tuple[bytes, bytes], int]) -> tuple[bytes, bytes] | None:
     if not pair_counts:
         return None  # Return None if there are no pairs to consider
     return max(pair_counts.items(), key=lambda item: (item[1], item[0]))[0]  # Return the pair with the highest count
 
-def initialize_vocabulary(special_tokens: list[str]) -> dict[int, tuple[bytes, ...]]:
+def initialize_vocabulary(special_tokens: list[str]) -> dict[int, bytes]:
     vocab = {}
     index = 0
     while index < 256:
@@ -82,8 +83,66 @@ def initialize_vocabulary(special_tokens: list[str]) -> dict[int, tuple[bytes, .
     
     return vocab
 
-def get_pair_hashmap(pretoken_counts: dict[tuple[bytes, ...], int]) -> dict[tuple[bytes, bytes], int]:
-    pair_hashmap = {} # pair -> sequence id
+def get_pair_hashmap(
+    sequences: list[tuple[bytes, ...]],
+) -> dict[tuple[bytes, bytes], set[int]]:
+    """Build an inverted index of adjacent pairs.
+
+    sequences: Current token tuples for each pre-token; list indices are stable sequence IDs.
+    Returns pair -> set of sequence IDs containing it, regardless of repeated occurrences.
+    Does not modify the input.
+    """
+    pair_sequences = defaultdict(set)
+    for sequence_id, sequence in enumerate(sequences):
+        for pair in zip(sequence, sequence[1:]):
+            pair_sequences[pair].add(sequence_id)
+    return dict(pair_sequences)
+
+
+def apply_indexed_merge(
+    sequences: list[tuple[bytes, ...]],
+    frequencies: list[int],
+    pair_counts: dict[tuple[bytes, bytes], int],
+    pair_sequences: dict[tuple[bytes, bytes], set[int]],
+    selected_pair: tuple[bytes, bytes],
+) -> None:
+    """Apply one merge and incrementally update statistics for affected sequences.
+
+    sequences: Sequence ID -> current token tuple; affected entries are replaced in place.
+    frequencies: Corpus frequency for each sequence ID; aligned with sequences and unchanged.
+    pair_counts: Pair -> global weighted occurrence count; updated in place.
+    pair_sequences: Pair -> set of sequence IDs containing it; updated in place.
+    selected_pair: The fixed pair to merge this round; must exist in the current index.
+    Returns None; callers use the updated sequences, pair_counts, and pair_sequences directly.
+
+    Sequence IDs remain stable. Local Counters preserve multiplicity, including two aa pairs in aaa.
+    """
+    # Updating the index below also changes selected_pair's membership set.
+    affected_ids = tuple(pair_sequences[selected_pair])
+    for sequence_id in affected_ids:
+        old_sequence = sequences[sequence_id]
+        new_sequence = merge_pair(old_sequence, selected_pair)
+        old_pairs = Counter(zip(old_sequence, old_sequence[1:]))
+        new_pairs = Counter(zip(new_sequence, new_sequence[1:]))
+        frequency = frequencies[sequence_id]
+
+        for pair in old_pairs.keys() | new_pairs.keys():
+            delta = (new_pairs[pair] - old_pairs[pair]) * frequency
+            if delta:
+                updated_count = pair_counts.get(pair, 0) + delta
+                if updated_count:
+                    pair_counts[pair] = updated_count
+                else:
+                    del pair_counts[pair]
+            if pair not in new_pairs:
+                members = pair_sequences[pair]
+                members.remove(sequence_id)
+                if not members:
+                    del pair_sequences[pair]
+            elif pair not in old_pairs:
+                pair_sequences.setdefault(pair, set()).add(sequence_id)
+
+        sequences[sequence_id] = new_sequence
 
 
 def apply_merge(pretoken_counts: dict[tuple[bytes, ...], int], pair: tuple[bytes, bytes]) -> dict[tuple[bytes, ...], int]:
@@ -120,15 +179,19 @@ def train_bpe(file, special_tokens, vocab_size):
             for pretoken_tuple, count in chunk_counts.items():
                 pretoken_counts[pretoken_tuple] = pretoken_counts.get(pretoken_tuple, 0) + count  # Merge counts from all chunks
 
-        pair_counts = pair_count_pretokens(pretoken_counts)  # Count the occurrences of each byte pair
+        # Stable sequence IDs let the inverted index survive tuple replacement.
+        sequences = list(pretoken_counts)
+        frequencies = list(pretoken_counts.values())
+        pair_sequences = get_pair_hashmap(sequences)
+        pair_counts = pair_count_pretokens(pretoken_counts)
         most_frequent_pair = get_most_frequent_pair(pair_counts)  # Get the most frequent byte pair
 
         while most_frequent_pair and len(vocab) < vocab_size:
             merges.append(most_frequent_pair)  # Add the most frequent pair to the list of merges
-            new_pretoken_counts = apply_merge(pretoken_counts, most_frequent_pair)  # Merge the most frequent pair in the pretoken counts
-            pretoken_counts = new_pretoken_counts  # Update the pretoken counts with the
+            apply_indexed_merge(
+                sequences, frequencies, pair_counts, pair_sequences, most_frequent_pair
+            )
             vocab[len(vocab)] = most_frequent_pair[0] + most_frequent_pair[1]  # Add the merged pair to the vocabulary
-            pair_counts = pair_count_pretokens(pretoken_counts)  # Recount the occurrences
             most_frequent_pair = get_most_frequent_pair(pair_counts)  # Get the next most frequent byte pair
 
     return vocab, merges
@@ -182,3 +245,27 @@ if __name__ == "__main__":
         train_bpe("unused.txt", ["<|endoftext|>"], 256)
     except ValueError as error:
         print("expected error:", error)
+
+    # 10. Inspect the initial state: sequence IDs are list indices, not token IDs.
+    pretoken_counts = {
+        (b"a", b"b", b"a", b"b"): 3,
+        (b"a", b"b", b"c"): 2,
+        (b"x",): 4,
+    }
+    sequences = list(pretoken_counts)
+    frequencies = list(pretoken_counts.values())
+    pair_sequences = get_pair_hashmap(sequences)
+    pair_counts = pair_count_pretokens(pretoken_counts)
+    most_frequent_pair = get_most_frequent_pair(pair_counts)
+
+    print("\n--- Indexed BPE state example ---")
+    print("pretoken_counts:", pretoken_counts)
+    print("sequences:", sequences)
+    print("frequencies:", frequencies)
+    for sequence_id, sequence in enumerate(sequences):
+        print(f"  sequence ID {sequence_id}: {sequence}, frequency={frequencies[sequence_id]}")
+    print("pair_sequences:", pair_sequences)
+    print("pair_counts:", pair_counts)
+    print("most_frequent_pair:", most_frequent_pair)
+    # (a, b) occurs twice in sequence 0 and once in sequence 1: 2 * 3 + 1 * 2 = 8.
+    # Its index is {0, 1}: membership records each sequence ID only once.
