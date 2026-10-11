@@ -1,3 +1,6 @@
+from collections.abc import Iterable
+import math
+import numpy.typing as npt
 import torch
 from torch import nn
 from jaxtyping import Bool, Float, Int
@@ -89,7 +92,7 @@ class RMSNorm(nn.Module):
     def __init__(
         self,
         d_model: int,
-        eps: float = 1e-8,
+        eps: float = 1e-5,
         weights: Float[torch.Tensor, "d_model"] | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
@@ -138,10 +141,27 @@ class SwiGLU(nn.Module):
         linear3 = self.linear3(x)
         return self.linear2(linear1 * linear3)
 
-def softmax(x: Float[torch.Tensor, "..."], dim: int) -> Float[torch.Tensor, "..."]:
+def softmax(x: Float[torch.Tensor, "..."], dim: int) -> Float[torch.Tensor, ""]:
     x_max = torch.max(x, dim=dim, keepdim=True).values
     x_exp = torch.exp(x - x_max)
     return x_exp / torch.sum(x_exp, dim=dim, keepdim=True)
+
+def cross_entropy_loss(logits: Float[torch.Tensor, "... vocab_size"], targets: Int[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
+    if logits.shape[:-1] != targets.shape:
+        raise ValueError(
+            f"Logits shape {tuple(logits.shape)} and targets shape {tuple(targets.shape)} "
+            "are incompatible."
+        )
+    if logits.shape[-1] < 1:
+        raise ValueError("Logits last dimension must be > 1.")
+    if targets.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Targets must be int32 or int64.")
+    if targets.numel() > 0:
+        if targets.min().item() < 0 or targets.max().item() >= logits.shape[-1]:
+            raise ValueError("Targets must be in [0, vocab_size).")
+
+    log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    return -log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1).mean()
 
 def scaled_dot_product_attention(
     Q: Float[torch.Tensor, "... queries d_k"],
@@ -261,7 +281,6 @@ class MultiHeadSelfAttention(nn.Module):
 
         seq_len = x.shape[-2]
         casual_mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool))
-
         attn_output = scaled_dot_product_attention(q, k, v, mask=casual_mask)
         attn_output = attn_output.transpose(-2, -3).reshape(*x.shape[:-1], -1)
 
@@ -271,3 +290,244 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        q_proj_weight: Float[torch.Tensor, " d_model d_model"],
+        k_proj_weight: Float[torch.Tensor, " d_model d_model"],
+        v_proj_weight: Float[torch.Tensor, " d_model d_model"],
+        o_proj_weight: Float[torch.Tensor, " d_model d_model"],
+        w1_weight: Float[torch.Tensor, "d_ff d_model"],
+        w2_weight: Float[torch.Tensor, "d_model d_ff"],
+        w3_weight: Float[torch.Tensor, "d_ff d_model"],
+        rmsnorm1_weight: Float[torch.Tensor, "d_model"],
+        rmsnorm2_weight: Float[torch.Tensor, "d_model"],
+        max_seq_len: int | None = None,
+        theta: float = 10000.0,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.attention = MultiHeadSelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            q_proj_weight=q_proj_weight,
+            k_proj_weight=k_proj_weight,
+            v_proj_weight=v_proj_weight,
+            o_proj_weight=o_proj_weight,
+            max_seq_len=max_seq_len,
+            theta=theta,
+            device=device,
+            dtype=dtype
+        )
+        self.norm1 = RMSNorm(d_model=d_model, weights=rmsnorm1_weight, device=device, dtype=dtype)
+        self.ffn = SwiGLU(
+            d_model=d_model,
+            d_ff=d_ff,
+            w1_weight=w1_weight,
+            w2_weight=w2_weight,
+            w3_weight=w3_weight,
+            device=device,
+            dtype=dtype
+        )
+        self.norm2 = RMSNorm(d_model=d_model, weights=rmsnorm2_weight, device=device, dtype=dtype)
+
+    def forward(self, x: Float[torch.Tensor, "... seq_len d_model"], token_positions: Int[torch.Tensor, "... seq_len"] | None = None) -> Float[torch.Tensor, "... seq_len d_model"]:
+        x = x + self.attention(self.norm1(x), token_positions=token_positions)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class TransformerLM(nn.Module):
+    def __init__(self,
+                vocab_size: int,
+                context_length: int,
+                d_model: int,
+                num_layers: int,
+                num_heads: int,
+                d_ff: int,
+                rope_theta: float,
+                weights: dict[str, torch.Tensor],
+                device: torch.device | str | None = None,
+                dtype: torch.dtype | None = None
+                 ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.weights = weights
+
+        self.embedding = Embedding(vocab_size, d_model, weights=self.weights["token_embeddings.weight"], device=device, dtype=dtype)
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                q_proj_weight=self.weights[f"layers.{i}.attn.q_proj.weight"],
+                k_proj_weight=self.weights[f"layers.{i}.attn.k_proj.weight"],
+                v_proj_weight=self.weights[f"layers.{i}.attn.v_proj.weight"],
+                o_proj_weight=self.weights[f"layers.{i}.attn.output_proj.weight"],
+                w1_weight=self.weights[f"layers.{i}.ffn.w1.weight"],
+                w2_weight=self.weights[f"layers.{i}.ffn.w2.weight"],
+                w3_weight=self.weights[f"layers.{i}.ffn.w3.weight"],
+                rmsnorm1_weight=self.weights[f"layers.{i}.ln1.weight"],
+                rmsnorm2_weight=self.weights[f"layers.{i}.ln2.weight"],
+                max_seq_len=context_length,
+                theta=rope_theta,
+                device=device,
+                dtype=dtype
+            ) for i in range(num_layers)
+        ])
+        self.final_norm = RMSNorm(d_model=d_model, weights=self.weights["ln_final.weight"], device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, weights=self.weights["lm_head.weight"], device=device, dtype=dtype)
+
+    def forward(self, x: Int[torch.Tensor, "... seq_len"]) -> Float[torch.Tensor, "... seq_len vocab_size"]:
+        if x.shape[-1] > self.context_length:
+            raise ValueError(f"Input sequence length {x.shape[-1]} exceeds context length {self.context_length}.")
+
+        x = self.embedding(x)
+        token_positions = torch.arange(x.shape[-2], device=x.device, dtype=torch.int64)
+
+        for layer in self.layers:
+            x = layer(x, token_positions=token_positions)
+
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+        return logits
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+    ) -> None:
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("AdamW does not support sparse gradients, please consider SparseAdam instead")
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["step"] = 1
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+
+                
+
+                with torch.no_grad():
+                    p.add_(p, alpha=-group["lr"] * group["weight_decay"])
+
+                lr_t = group["lr"] * (1 - group["betas"][1] ** state["step"]) ** 0.5 / (1 - group["betas"][0] ** state["step"])
+
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+
+                state['step'] = state.get("step", 0) + 1
+                beta1, beta2 = group["betas"]
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                with torch.no_grad():
+                    p.add_(exp_avg / (exp_avg_sq.sqrt() + group["eps"]), alpha=-lr_t)
+
+
+        return loss
+
+PI = math.pi
+    
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+):
+    if max_learning_rate < 0:
+        raise ValueError(f"max_learning_rate must be non-negative, got {max_learning_rate}.")
+    if min_learning_rate < 0:
+        raise ValueError(f"min_learning_rate must be non-negative, got {min_learning_rate}.")
+    if warmup_iters < 0:
+        raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}.")
+    if cosine_cycle_iters < 0:
+        raise ValueError(f"cosine_cycle_iters must be non-negative, got {cosine_cycle_iters}.")
+    
+    if it < warmup_iters:
+        return it / warmup_iters * max_learning_rate
+    elif it < cosine_cycle_iters:
+        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + math.cos(progress * PI))
+    else:
+        return min_learning_rate
+
+
+def gradient_clip(
+    parameters: Iterable[torch.nn.Parameter], 
+    max_l2_norm: float,
+    eps: float = 1e-6    
+) -> None:
+    if max_l2_norm < 0:
+        raise ValueError(f"max_l2_norm must be non-negative, got {max_l2_norm}.")
+
+    if eps < 0:
+        raise ValueError(f"eps must be non-negative, got {eps}.")
+
+    params = []
+    for p in parameters:
+        if p.grad is not None:
+            params.append(p)
+
+    if not params:
+        return
+
+    total_l2_norm = torch.sqrt(sum([
+    torch.sum(
+        (p.grad.float() if p.grad.dtype in (torch.float16, torch.bfloat16)
+         else p.grad) ** 2
+    )
+    for p in params
+    ]))
+
+    with torch.no_grad():
+        if total_l2_norm > max_l2_norm:
+            clip_coef = max_l2_norm / (total_l2_norm + eps)
+            for p in params:
+                    p.grad.mul_(clip_coef)
+
+def load_data(
+  dataset: npt.NDArray, batch_size: int, context_length: int, device: str     
+):
