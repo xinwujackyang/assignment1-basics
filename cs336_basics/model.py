@@ -1,5 +1,8 @@
 from collections.abc import Iterable
 import math
+import os
+from typing import BinaryIO
+import numpy as np
 import numpy.typing as npt
 import torch
 from torch import nn
@@ -17,7 +20,7 @@ class Linear(nn.Module):
         super().__init__()
         # self.weight = torch.nn.Parameter(weight_tensor)
         if weights is not None:
-            self.weight = nn.Parameter(weights)
+            self.weight = nn.Parameter(weights.to(device=device, dtype=dtype))
         else:
             self.weight = nn.Parameter(
                 torch.empty(
@@ -59,7 +62,7 @@ class Embedding(nn.Module):
                     f"got {tuple(weights.shape)}"
                 )
             else:
-                self.weight = weights
+                self.weight = nn.Parameter(weights.to(device=device, dtype=dtype))
         else:
             self.weight = nn.Parameter(
                 torch.empty(
@@ -106,16 +109,16 @@ class RMSNorm(nn.Module):
                     f"got {tuple(weights.shape)}"
                 )
             else:
-                self.scale = nn.Parameter(weights)
+                self.scale = nn.Parameter(weights.to(device=device, dtype=dtype))
         else:
-            self.scale = nn.Parameter(torch.ones(d_model))
+            self.scale = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
 
 
     def forward(self, x: Float[torch.Tensor, "... d_model"]) -> Float[torch.Tensor, "... d_model"]:
         input_type = x.dtype
         x = x.to(torch.float32)
         norm = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        return self.scale * (x / norm).to(input_type)
+        return (self.scale * (x / norm)).to(input_type)
 
 def silu(x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
     return x * torch.sigmoid(x)
@@ -239,10 +242,10 @@ class MultiHeadSelfAttention(nn.Module):
         self,
         d_model: int,
         num_heads: int,
-        q_proj_weight: Float[torch.Tensor, " d_model d_model"],
-        k_proj_weight: Float[torch.Tensor, " d_model d_model"],
-        v_proj_weight: Float[torch.Tensor, " d_model d_model"],
-        o_proj_weight: Float[torch.Tensor, " d_model d_model"],
+        q_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
+        k_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
+        v_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
+        o_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
         max_seq_len: int | None = None,
         theta: float = 10000.0,
         device: torch.device | str | None = None,
@@ -296,15 +299,15 @@ class TransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        q_proj_weight: Float[torch.Tensor, " d_model d_model"],
-        k_proj_weight: Float[torch.Tensor, " d_model d_model"],
-        v_proj_weight: Float[torch.Tensor, " d_model d_model"],
-        o_proj_weight: Float[torch.Tensor, " d_model d_model"],
-        w1_weight: Float[torch.Tensor, "d_ff d_model"],
-        w2_weight: Float[torch.Tensor, "d_model d_ff"],
-        w3_weight: Float[torch.Tensor, "d_ff d_model"],
-        rmsnorm1_weight: Float[torch.Tensor, "d_model"],
-        rmsnorm2_weight: Float[torch.Tensor, "d_model"],
+        q_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
+        k_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
+        v_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
+        o_proj_weight: Float[torch.Tensor, " d_model d_model"] | None = None,
+        w1_weight: Float[torch.Tensor, "d_ff d_model"] | None = None,
+        w2_weight: Float[torch.Tensor, "d_model d_ff"] | None = None,
+        w3_weight: Float[torch.Tensor, "d_ff d_model"] | None = None,
+        rmsnorm1_weight: Float[torch.Tensor, "d_model"] | None = None,
+        rmsnorm2_weight: Float[torch.Tensor, "d_model"] | None = None,
         max_seq_len: int | None = None,
         theta: float = 10000.0,
         device: torch.device | str | None = None,
@@ -350,7 +353,7 @@ class TransformerLM(nn.Module):
                 num_heads: int,
                 d_ff: int,
                 rope_theta: float,
-                weights: dict[str, torch.Tensor],
+                weights: dict[str, torch.Tensor] | None = None,
                 device: torch.device | str | None = None,
                 dtype: torch.dtype | None = None
                  ):
@@ -362,32 +365,34 @@ class TransformerLM(nn.Module):
         self.num_heads = num_heads
         self.d_ff = d_ff
         self.rope_theta = rope_theta
-        self.weights = weights
+        # Missing keys in supplied weights must not silently initialize randomly.
+        def get_weight(key: str) -> torch.Tensor | None:
+            return None if weights is None else weights[key]
 
-        self.embedding = Embedding(vocab_size, d_model, weights=self.weights["token_embeddings.weight"], device=device, dtype=dtype)
+        self.embedding = Embedding(vocab_size, d_model, weights=get_weight("token_embeddings.weight"), device=device, dtype=dtype)
 
         self.layers = nn.ModuleList([
             TransformerBlock(
                 d_model=d_model,
                 num_heads=num_heads,
                 d_ff=d_ff,
-                q_proj_weight=self.weights[f"layers.{i}.attn.q_proj.weight"],
-                k_proj_weight=self.weights[f"layers.{i}.attn.k_proj.weight"],
-                v_proj_weight=self.weights[f"layers.{i}.attn.v_proj.weight"],
-                o_proj_weight=self.weights[f"layers.{i}.attn.output_proj.weight"],
-                w1_weight=self.weights[f"layers.{i}.ffn.w1.weight"],
-                w2_weight=self.weights[f"layers.{i}.ffn.w2.weight"],
-                w3_weight=self.weights[f"layers.{i}.ffn.w3.weight"],
-                rmsnorm1_weight=self.weights[f"layers.{i}.ln1.weight"],
-                rmsnorm2_weight=self.weights[f"layers.{i}.ln2.weight"],
+                q_proj_weight=get_weight(f"layers.{i}.attn.q_proj.weight"),
+                k_proj_weight=get_weight(f"layers.{i}.attn.k_proj.weight"),
+                v_proj_weight=get_weight(f"layers.{i}.attn.v_proj.weight"),
+                o_proj_weight=get_weight(f"layers.{i}.attn.output_proj.weight"),
+                w1_weight=get_weight(f"layers.{i}.ffn.w1.weight"),
+                w2_weight=get_weight(f"layers.{i}.ffn.w2.weight"),
+                w3_weight=get_weight(f"layers.{i}.ffn.w3.weight"),
+                rmsnorm1_weight=get_weight(f"layers.{i}.ln1.weight"),
+                rmsnorm2_weight=get_weight(f"layers.{i}.ln2.weight"),
                 max_seq_len=context_length,
                 theta=rope_theta,
                 device=device,
                 dtype=dtype
             ) for i in range(num_layers)
         ])
-        self.final_norm = RMSNorm(d_model=d_model, weights=self.weights["ln_final.weight"], device=device, dtype=dtype)
-        self.lm_head = Linear(d_model, vocab_size, weights=self.weights["lm_head.weight"], device=device, dtype=dtype)
+        self.final_norm = RMSNorm(d_model=d_model, weights=get_weight("ln_final.weight"), device=device, dtype=dtype)
+        self.lm_head = Linear(d_model, vocab_size, weights=get_weight("lm_head.weight"), device=device, dtype=dtype)
 
     def forward(self, x: Int[torch.Tensor, "... seq_len"]) -> Float[torch.Tensor, "... seq_len vocab_size"]:
         if x.shape[-1] > self.context_length:
@@ -529,5 +534,67 @@ def gradient_clip(
                     p.grad.mul_(clip_coef)
 
 def load_data(
-  dataset: npt.NDArray, batch_size: int, context_length: int, device: str     
-):
+    dataset: npt.NDArray,
+    batch_size: int,
+    context_length: int,
+    device: str,
+) -> tuple[Int[torch.Tensor, "batch_size context_length"], Int[torch.Tensor, "batch_size context_length"]]:
+    """Sample windows from a 1D integer token array, including a memory map.
+
+    batch_size is the number of independently sampled windows; context_length
+    is the number of tokens per window. Both int64 outputs are moved to device.
+    Targets contain the next token for each corresponding input token.
+    """
+    if dataset.ndim != 1:
+        raise ValueError("dataset must be a one-dimensional array.")
+    if not np.issubdtype(dataset.dtype, np.integer):
+        raise TypeError("dataset must contain integer token IDs.")
+    if batch_size <= 0 or context_length <= 0:
+        raise ValueError("batch_size and context_length must be positive.")
+    if len(dataset) <= context_length:
+        raise ValueError("dataset must contain at least context_length + 1 tokens.")
+
+    # The exclusive upper bound reserves one extra token for the final target.
+    starts = np.random.randint(0, len(dataset) - context_length, size=batch_size)
+    # Copy only sampled windows, not the full dataset, to support large memmaps.
+    windows = np.stack([
+        dataset[start:start + context_length + 1] for start in starts
+    ]).astype(np.int64, copy=False)
+    inputs = torch.from_numpy(windows[:, :-1].copy()).to(device)
+    targets = torch.from_numpy(windows[:, 1:].copy()).to(device)
+    return inputs, targets
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO,
+) -> None:
+    """Save model state, optimizer state, and completed iteration count.
+
+    out is a file path or a writable binary stream. Model architecture is not
+    serialized; loading requires an already constructed compatible model.
+    """
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    """Restore existing model and optimizer objects; return completed iterations.
+
+    src is a file path or a readable binary stream positioned at the checkpoint.
+    The optimizer must reference the supplied model's parameters. Load tensors
+    on CPU first so a checkpoint does not require its original saving device.
+    """
+    checkpoint = torch.load(src, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return checkpoint["iteration"]
