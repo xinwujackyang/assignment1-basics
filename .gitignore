@@ -161,3 +161,7 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# Local corpora, token arrays, and training checkpoints.
+data/
+checkpoints/
